@@ -1,4 +1,6 @@
 import { useState, useCallback } from 'react';
+import { extractFramesFromVideo, getRecommendedFrameCount } from '@/utils/frameExtractor';
+import { toast } from 'sonner';
 
 interface AnalysisResult {
   confidence: number;
@@ -24,25 +26,6 @@ interface UseVideoAnalysisReturn {
   reset: () => void;
 }
 
-// Simulated analysis - In production, this would call your Python backend API
-const simulateAnalysis = (): AnalysisResult => {
-  const isRealVideo = Math.random() > 0.5;
-  const baseConfidence = isRealVideo ? 0.75 + Math.random() * 0.2 : 0.65 + Math.random() * 0.25;
-  
-  return {
-    confidence: baseConfidence,
-    verdict: isRealVideo ? 'real' : 'ai-generated',
-    details: {
-      faceConsistency: 0.5 + Math.random() * 0.5,
-      temporalCoherence: 0.4 + Math.random() * 0.5,
-      artifactScore: 0.3 + Math.random() * 0.6,
-      compressionAnalysis: 0.5 + Math.random() * 0.4,
-    },
-    framesAnalyzed: Math.floor(100 + Math.random() * 200),
-    processingTime: 3 + Math.random() * 5,
-  };
-};
-
 export const useVideoAnalysis = (): UseVideoAnalysisReturn => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -54,46 +37,88 @@ export const useVideoAnalysis = (): UseVideoAnalysisReturn => {
     setProgress(0);
     setResult(null);
 
-    const steps: { step: AnalysisStep; duration: number; targetProgress: number }[] = [
-      { step: 'extracting', duration: 1500, targetProgress: 25 },
-      { step: 'analyzing', duration: 2500, targetProgress: 65 },
-      { step: 'computing', duration: 1500, targetProgress: 85 },
-      { step: 'generating', duration: 1000, targetProgress: 100 },
-    ];
-
-    for (const { step, duration, targetProgress } of steps) {
-      setCurrentStep(step);
+    try {
+      // Step 1: Extract frames from video
+      setCurrentStep('extracting');
       
-      // Animate progress
-      const startProgress = step === 'extracting' ? 0 : steps[steps.indexOf({ step, duration, targetProgress }) - 1]?.targetProgress || 0;
-      const increment = (targetProgress - startProgress) / (duration / 50);
+      // Create a temporary video element to get duration
+      const video = document.createElement('video');
+      video.preload = 'metadata';
       
-      await new Promise<void>((resolve) => {
-        let currentProgress = startProgress;
-        const interval = setInterval(() => {
-          currentProgress += increment;
-          if (currentProgress >= targetProgress) {
-            currentProgress = targetProgress;
-            clearInterval(interval);
-            resolve();
-          }
-          setProgress(currentProgress);
-        }, 50);
+      const duration = await new Promise<number>((resolve) => {
+        video.onloadedmetadata = () => resolve(video.duration);
+        video.src = URL.createObjectURL(file);
       });
+      
+      const frameCount = getRecommendedFrameCount(duration);
+      
+      const frames = await extractFramesFromVideo(file, {
+        maxFrames: frameCount,
+        quality: 0.8,
+        onProgress: (p) => setProgress(p * 0.25), // 0-25% for extraction
+      });
+
+      if (frames.length === 0) {
+        throw new Error('Failed to extract frames from video');
+      }
+
+      // Step 2: Send frames for AI analysis
+      setCurrentStep('analyzing');
+      setProgress(30);
+
+      const response = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/analyze-video`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+          },
+          body: JSON.stringify({ frames }),
+        }
+      );
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        
+        if (response.status === 429) {
+          throw new Error('Rate limit exceeded. Please wait a moment and try again.');
+        }
+        if (response.status === 402) {
+          throw new Error('AI credits exhausted. Please add credits to continue.');
+        }
+        
+        throw new Error(errorData.error || 'Analysis failed');
+      }
+
+      // Step 3: Process results
+      setCurrentStep('computing');
+      setProgress(85);
+
+      const analysisResult = await response.json();
+
+      // Step 4: Generate final report
+      setCurrentStep('generating');
+      setProgress(95);
+
+      // Small delay for UX
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      setProgress(100);
+      setResult({
+        confidence: analysisResult.confidence,
+        verdict: analysisResult.verdict,
+        details: analysisResult.details,
+        framesAnalyzed: analysisResult.framesAnalyzed,
+        processingTime: analysisResult.processingTime,
+      });
+    } catch (error) {
+      console.error('Video analysis error:', error);
+      toast.error(error instanceof Error ? error.message : 'Analysis failed. Please try again.');
+      setResult(null);
+    } finally {
+      setIsProcessing(false);
     }
-
-    // Simulate backend processing delay
-    await new Promise(resolve => setTimeout(resolve, 500));
-
-    // In production, you would call your Python API here:
-    // const response = await fetch('/api/analyze', {
-    //   method: 'POST',
-    //   body: formData
-    // });
-    // const result = await response.json();
-
-    setResult(simulateAnalysis());
-    setIsProcessing(false);
   }, []);
 
   const reset = useCallback(() => {
